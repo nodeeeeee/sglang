@@ -78,6 +78,13 @@ def _is_sm107_supported() -> bool:
 def _prepare_flashinfer_mxfp8_activations(
     x: torch.Tensor, hidden_size: int
 ) -> tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
+    from sglang.srt.layers.moe import norm_quant_handoff
+
+    norm_prepared = norm_quant_handoff.take(x, hidden_size)
+    if norm_prepared is not None:
+        x_quant, x_scale = norm_prepared
+        return x, None, x_quant, x_scale.view(torch.float8_e4m3fn)
+
     prepared = None
     if x.shape[-1] == hidden_size:
         if x.dim() > 2:

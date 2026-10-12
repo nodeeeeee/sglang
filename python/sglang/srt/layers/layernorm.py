@@ -466,6 +466,7 @@ class RMSNorm(BaseFusedOp):
         force_native: bool = False,
     ) -> None:
         super().__init__()
+        self.fuse_mxfp8 = False
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual
@@ -618,7 +619,31 @@ class RMSNorm(BaseFusedOp):
                 # we probably need to add another parameter to fused_add_rmsnorm
                 if post_residual_addition is not None:
                     residual = residual + post_residual_addition
-                fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+                from sglang.kernels.ops.layernorm.rmsnorm_row_parallel import (
+                    try_fused_add_rmsnorm,
+                )
+
+                fused_quant = False
+                if (
+                    self.fuse_mxfp8 and x.dtype == torch.bfloat16
+                    and x.shape[1] == 2880 and x.shape[0] > 0
+                    and residual.dtype == x.dtype and residual.shape == x.shape
+                    and self.weight.dtype == x.dtype
+                    and x.is_contiguous() and residual.is_contiguous()
+                    and x.data_ptr() % 128 == 0 and residual.data_ptr() % 128 == 0
+                ):
+                    from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import fused_norm_quant
+                    from sglang.srt.layers.moe import norm_quant_handoff
+
+                    quant, scale = fused_norm_quant(
+                        x, residual, self.weight.data, self.variance_epsilon
+                    )
+                    norm_quant_handoff.publish(x, quant, scale)
+                    fused_quant = True
+                if not fused_quant and not try_fused_add_rmsnorm(
+                    x, residual, self.weight.data, self.variance_epsilon
+                ):
+                    fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
                 result = x, residual
         else:
             result = rmsnorm(x, self.weight.data, self.variance_epsilon)

@@ -601,6 +601,16 @@ class GptOssDecoderLayer(nn.Module):
             x_pad_to_multiple=post_attn_pad_multiple,
         )
 
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        self.fuse_norm_quant = (
+            _is_cuda and config.hidden_size == 2880
+            and quant_config is not None and quant_config.get_name() == "mxfp4"
+            and get_parallel().tp_size == 1 and get_parallel().dwdp_size == 1
+            and get_moe_runner_backend().is_flashinfer_mxfp4()
+            and torch.cuda.get_device_capability() == (10, 0)
+        )
+        self.post_attention_layernorm.fuse_mxfp8 = self.fuse_norm_quant
         self.attn_boundary, self.ffn_boundary = append_stages(
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
@@ -640,9 +650,18 @@ class GptOssDecoderLayer(nn.Module):
             )
 
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
-        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        if self.fuse_norm_quant:
+            from sglang.srt.layers.moe import norm_quant_handoff
 
-        hidden_states = self.mlp(hidden_states, forward_batch)
+            norm_quant_handoff.clear()
+            try:
+                hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+                hidden_states = self.mlp(hidden_states, forward_batch)
+            finally:
+                norm_quant_handoff.clear()
+        else:
+            hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+            hidden_states = self.mlp(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
 
         return hidden_states
