@@ -35,7 +35,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_token_to_kv_pool,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec
@@ -283,7 +286,9 @@ class AutoWeightsLoader:
         return set(self._load_module("", self.module, weights))
 
 
-def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
+def enable_fused_set_kv_buffer(
+    forward_batch: ForwardBatch, layer: Optional[RadixAttention] = None
+):
     """Enable fused set_kv_buffer on CUDA with bfloat16 KV cache and HIP with bf16/fp16/fp8 KV cache.
 
     SHUFFLE 5D pools on HIP also work — the underlying triton kernel
@@ -292,15 +297,39 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     the per-layer arg builder to pass the raw 5D buffers without the
     `.view(-> 4D NHD)` reshape, and let the rotary forward pass
     `flash_layout=False`. See `create_fused_set_kv_buffer_arg` below.
+
+    CUDA hybrid SWA additionally requires a layer and an attention backend
+    that publishes safe per-layer write locations.
     """
     pool = get_token_to_kv_pool()
-    return (
+    if (
         _is_cuda
         and pool.dtype == torch.bfloat16
-        and not isinstance(pool, SWAKVPool)
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
+    ):
+        if not isinstance(pool, SWAKVPool):
+            return True
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            is_in_breakable_cuda_graph,
+        )
+        from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
+            is_in_tc_piecewise_cuda_graph,
+        )
+
+        # Piecewise prefill refreshes attention metadata outside the captured
+        # RoPE segment. Its fresh SWA snapshot is not a stable graph input.
+        if (
+            layer is None
+            or is_in_tc_piecewise_cuda_graph()
+            or is_in_breakable_cuda_graph()
+        ):
+            return False
+        return (
+            get_attn_backend().get_fused_set_kv_buffer_cache_loc(layer, forward_batch)
+            is not None
+        )
+    return _is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None
 
 
 def create_fused_set_kv_buffer_arg(
@@ -317,11 +346,21 @@ def create_fused_set_kv_buffer_arg(
     if not _is_hip:
         # CUDA path.
         assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
+        cache_loc = forward_batch.out_cache_loc
+        reserved_skip_index = -1
+        if isinstance(token_to_kv_pool, SWAKVPool):
+            cache_loc = get_attn_backend().get_fused_set_kv_buffer_cache_loc(
+                layer, forward_batch
+            )
+            assert cache_loc is not None, "backend has no fused SWA write snapshot"
+            # Match the separate store_cache operation's reserved padding slot.
+            reserved_skip_index = 0
         return FusedSetKVBufferArg(
             value=value,
             k_buffer=k_buffer.view(k_buffer.shape[0], -1),
             v_buffer=v_buffer.view(v_buffer.shape[0], -1),
-            cache_loc=forward_batch.out_cache_loc,
+            cache_loc=cache_loc,
+            reserved_skip_index=reserved_skip_index,
         )
     else:
         # ROCm path.
@@ -329,7 +368,7 @@ def create_fused_set_kv_buffer_arg(
         # A non-hybrid pool has no full->SWA remap: SWA and full layers
         # share one slot space indexed directly by out_cache_loc (as --disable-hybrid-swa-memory
         # gives). Leaving swa_slot_mapping=None makes the fused store write at
-        # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
+        # out_cache_loc, matching the CUDA path for non-hybrid pools.
         full_to_swa = (
             token_to_kv_pool.full_to_swa_index_mapping
             if isinstance(token_to_kv_pool, SWAKVPool)

@@ -28,11 +28,17 @@ def _jit_rotary_embedding_module() -> Module:
 
 @cache_once
 def _jit_fused_rope_module(
-    is_neox: bool, rope_dim: int, dtype: torch.dtype, q_dtype: torch.dtype
+    is_neox: bool,
+    rope_dim: int,
+    dtype: torch.dtype,
+    q_dtype: torch.dtype,
+    reserved_skip_index: int = -1,
 ) -> Module:
     # q_dtype supports a same-size mixed-dtype q, e.g. fp16 q with bf16 k;
     # k/v/caches use dtype.
-    args = make_cpp_args(is_neox, rope_dim, is_arch_support_pdl(), dtype, q_dtype)
+    args = make_cpp_args(
+        is_neox, rope_dim, is_arch_support_pdl(), dtype, q_dtype, reserved_skip_index
+    )
     return load_jit(
         "fused_rope",
         *args,
@@ -111,6 +117,9 @@ class FusedSetKVBufferArg:
     k_buffer: torch.Tensor
     v_buffer: torch.Tensor
     cache_loc: torch.Tensor
+    # Preserve the legacy API's slot-zero writes unless the pool opts into
+    # reserved padding semantics (SGLang's hybrid pool reserves slot zero).
+    reserved_skip_index: int = -1
 
 
 @register_custom_op(mutates_args=["q", "k"])
@@ -154,6 +163,7 @@ def apply_rope_inplace_with_kvcache(
     *,
     is_neox: bool,
     rope_dim: int = 0,
+    reserved_skip_index: int = -1,
 ) -> None:
     """
     Fused inplace RoPE + KV cache store.
@@ -172,10 +182,14 @@ def apply_rope_inplace_with_kvcache(
         out_loc: Cache write locations of shape [num_tokens], same dtype as positions.
         is_neox: Whether to use GPT-NeoX style (True) or GPT-J interleaved (False).
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
+        reserved_skip_index: Nonnegative reserved slot to leave untouched. Enables
+            cache bounds checking; -1 preserves the legacy store behavior.
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
     v = v.view_as(k)
-    module = _jit_fused_rope_module(is_neox, rope_dim, k.dtype, q.dtype)
+    module = _jit_fused_rope_module(
+        is_neox, rope_dim, k.dtype, q.dtype, reserved_skip_index
+    )
     module.run_rope_store(q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc)
 
 
@@ -218,6 +232,7 @@ def apply_rope_with_cos_sin_cache_inplace(
             fused_args.cache_loc,
             is_neox=is_neox,
             rope_dim=rope_dim,
+            reserved_skip_index=fused_args.reserved_skip_index,
         )
     else:
         apply_rope_inplace(

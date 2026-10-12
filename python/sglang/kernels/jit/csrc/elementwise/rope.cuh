@@ -9,6 +9,7 @@
 
 #include <dlpack/dlpack.h>
 
+#include <cassert>
 #include <numeric>
 
 namespace sglang {
@@ -34,6 +35,7 @@ struct FusedRopeStoreParams {
   const void* __restrict__ out_loc;
   int64_t v_stride_bytes;
   int64_t cache_stride_bytes;
+  int64_t cache_size;
 };
 
 constexpr uint32_t kBlockSize = 128;
@@ -173,7 +175,8 @@ template <
     typename DType,
     typename QDType,
     typename IdType,
-    uint32_t kWorkThreads>
+    uint32_t kWorkThreads,
+    int64_t kReservedSkipIndex>
 __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStoreParams params) {
   using namespace device;
 
@@ -183,7 +186,7 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
   static_assert(kRopeDim == kDimPerThread * kWorkThreads);
   static_assert(sizeof(QDType) == sizeof(DType), "q/k must be same-size dtypes");
 
-  const auto& [base_params, v_ptr, k_cache, v_cache, out_loc, v_stride_bytes, cache_stride_bytes] = params;
+  const auto& [base_params, v_ptr, k_cache, v_cache, out_loc, v_stride_bytes, cache_stride_bytes, cache_size] = params;
   const auto &[
     q, k, cos_sin_cache_ptr, positions, // pointers
     q_stride_bytes, k_stride_bytes, head_stride_bytes,  // strides
@@ -222,7 +225,13 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
       // q rotates in place only (no cache store); may be a different dtype.
       rope_rotate_head<QDType, kIsNeox, kRopeDim, kVecSize>(input, cos_ptr, sin_ptr, lane_id);
     } else {
-      const auto k_out = pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
+      if constexpr (kReservedSkipIndex >= 0) {
+        // Match store_cache: validate before skipping the reserved graph slot.
+        assert(loc >= 0 && loc < cache_size);
+      }
+      const auto k_out = (kReservedSkipIndex >= 0 && loc == kReservedSkipIndex)
+                            ? nullptr
+                            : pointer::offset(k_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
       rope_rotate_head<DType, kIsNeox, kRopeDim, kVecSize>(input, cos_ptr, sin_ptr, lane_id, k_out);
     }
   }
@@ -234,6 +243,10 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
     const int64_t token_id = idx / num_kv_heads;
     const int64_t head_id = idx % num_kv_heads;
     const auto loc = static_cast<const IdType*>(out_loc)[token_id];
+    if constexpr (kReservedSkipIndex >= 0) {
+      assert(loc >= 0 && loc < cache_size);
+      if (loc == kReservedSkipIndex) continue;
+    }
     const auto input = pointer::offset(v_ptr, token_id * v_stride_bytes, head_id * head_stride_bytes);
     const auto input_vec = load_as<VStorage>(input, lane_id);
     const auto output = pointer::offset(v_cache, loc * cache_stride_bytes, head_id * head_stride_bytes);
@@ -244,7 +257,13 @@ __global__ void fused_rope_store_kernel(const __grid_constant__ FusedRopeStorePa
 
 // QDType (default = DType) is q's dtype; k/v/caches use DType. Same-size
 // dtypes only (fp16 q with bf16 k for the fp8-KV fp16-Q feed).
-template <bool kIsNeox, int64_t kRopeDim, bool kUsePDL, typename DType, typename QDType = DType>
+template <
+    bool kIsNeox,
+    int64_t kRopeDim,
+    bool kUsePDL,
+    typename DType,
+    typename QDType = DType,
+    int64_t kReservedSkipIndex = -1>
 struct FusedRopeKernel {
   static constexpr uint32_t kDimPerThread = std::gcd(16 / sizeof(DType), kRopeDim);
   static constexpr uint32_t kWorkThreads = next_pow2(kRopeDim, kDimPerThread);
@@ -257,7 +276,7 @@ struct FusedRopeKernel {
   static constexpr auto _kernel_0 = fused_rope_kernel<kIsNeox, kRopeDim, kUsePDL, DType, QDType, IdType, kWorkThreads>;
   template <typename IdType>
   static constexpr auto _kernel_1 =
-      fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, QDType, IdType, kWorkThreads>;
+      fused_rope_store_kernel<kIsNeox, kRopeDim, kUsePDL, DType, QDType, IdType, kWorkThreads, kReservedSkipIndex>;
 
   static auto get_num_sm(DLDevice device) {
     static const auto kNumSM = host::runtime::get_sm_count(device.device_id);
@@ -374,6 +393,7 @@ struct FusedRopeKernel {
     auto Dv = SymbolicSize{"v_stride"};
     auto Dd = SymbolicSize{"head_stride"};
     auto Dc = SymbolicSize{"cache_stride"};
+    auto C = SymbolicSize{"cache_size"};
     auto device = SymbolicDevice{};
     auto id_type = SymbolicDType{};
     D.set_value(kRopeDim);
@@ -403,7 +423,7 @@ struct FusedRopeKernel {
         .with_device(device)
         .verify(positions)
         .verify(out_loc);
-    TensorMatcher({-1, R})  // k_cache
+    TensorMatcher({C, R})  // k_cache
         .with_strides({Dc, 1})
         .with_dtype<DType>()
         .with_device(device)
@@ -447,6 +467,7 @@ struct FusedRopeKernel {
         .out_loc = out_loc.data_ptr(),
         .v_stride_bytes = v_stride_bytes,
         .cache_stride_bytes = cache_stride_bytes,
+        .cache_size = C.unwrap(),
     };
 
     const auto is_int32 = id_type.is_type<int32_t>();

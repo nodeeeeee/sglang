@@ -436,5 +436,115 @@ def test_fused_rope_store(
     assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
 
 
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
+def test_fused_rope_store_reserved_skip_index_graph(
+    index_dtype: torch.dtype, is_neox: bool
+) -> None:
+    """Graph padding must skip cache writes without skipping Q/K rotation.
+
+    Packed projections and padded cache rows have independent strides. Replaying
+    with changed positions and slot indices must match the separate operators,
+    including when every request targets the reserved slot.
+    """
+    from sglang.kernels.ops.attention.rope import (
+        apply_rope_inplace,
+        apply_rope_inplace_with_kvcache,
+    )
+    from sglang.kernels.ops.kvcache.kvcache import store_cache
+
+    batch_size, num_q_heads, num_kv_heads, head_dim = 7, 8, 2, 64
+    cache_size = 19
+    q_width, kv_width = num_q_heads * head_dim, num_kv_heads * head_dim
+    generator = torch.Generator(device=DEVICE).manual_seed(42)
+
+    def random_tensor(*shape):
+        return torch.randn(*shape, device=DEVICE, dtype=DTYPE, generator=generator)
+
+    # Every projection has a strided token dimension; the final columns guard
+    # against writes beyond Q/K/V. Cache rows use a separate padded stride.
+    qkv_initial = random_tensor(batch_size, q_width + 2 * kv_width + 32)
+    k_cache_initial = random_tensor(cache_size, kv_width + 32)
+    v_cache_initial = random_tensor(cache_size, kv_width + 32)
+    qkv_ref, qkv_fused = qkv_initial.clone(), qkv_initial.clone()
+    k_cache_ref, k_cache_fused = k_cache_initial.clone(), k_cache_initial.clone()
+    v_cache_ref, v_cache_fused = v_cache_initial.clone(), v_cache_initial.clone()
+
+    def projections(qkv):
+        q, k, v = qkv[:, : q_width + 2 * kv_width].split(
+            [q_width, kv_width, kv_width], dim=-1
+        )
+        return (
+            q.view(batch_size, num_q_heads, head_dim),
+            k.view(batch_size, num_kv_heads, head_dim),
+            v.view(batch_size, num_kv_heads, head_dim),
+        )
+
+    q_ref, k_ref, v_ref = projections(qkv_ref)
+    q_fused, k_fused, v_fused = projections(qkv_fused)
+    positions = torch.arange(1, batch_size + 1, device=DEVICE, dtype=index_dtype)
+    out_loc = torch.tensor([0, 3, 0, 9, 0, 12, 15], device=DEVICE, dtype=index_dtype)
+    cos_sin_cache = create_cos_sin_cache(head_dim, max_position=64)
+
+    def fused():
+        apply_rope_inplace_with_kvcache(
+            q_fused,
+            k_fused,
+            v_fused,
+            k_cache_fused[:, :kv_width],
+            v_cache_fused[:, :kv_width],
+            cos_sin_cache,
+            positions,
+            out_loc,
+            is_neox=is_neox,
+            reserved_skip_index=0,
+        )
+
+    def check(run):
+        for dst, src in (
+            (qkv_ref, qkv_initial),
+            (qkv_fused, qkv_initial),
+            (k_cache_ref, k_cache_initial),
+            (k_cache_fused, k_cache_initial),
+            (v_cache_ref, v_cache_initial),
+            (v_cache_fused, v_cache_initial),
+        ):
+            dst.copy_(src)
+        apply_rope_inplace(q_ref, k_ref, cos_sin_cache, positions, is_neox=is_neox)
+        store_cache(
+            k_ref.view(batch_size, kv_width),
+            v_ref.view(batch_size, kv_width),
+            k_cache_ref[:, :kv_width],
+            v_cache_ref[:, :kv_width],
+            out_loc,
+            reserved_skip_index=0,
+        )
+        run()
+        # Full backing comparisons also check V and projection padding, plus
+        # all unselected cache rows and per-row padding columns.
+        assert torch.equal(qkv_fused, qkv_ref)
+        assert torch.equal(k_cache_fused, k_cache_ref)
+        assert torch.equal(v_cache_fused, v_cache_ref)
+        untouched = torch.ones(cache_size, dtype=torch.bool, device=DEVICE)
+        untouched[out_loc[out_loc != 0].long()] = False
+        assert torch.equal(k_cache_fused[untouched], k_cache_initial[untouched])
+        assert torch.equal(v_cache_fused[untouched], v_cache_initial[untouched])
+        assert torch.equal(k_cache_fused[:, kv_width:], k_cache_initial[:, kv_width:])
+        assert torch.equal(v_cache_fused[:, kv_width:], v_cache_initial[:, kv_width:])
+
+    check(fused)  # Compile and check the eager path before capture.
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused()
+    positions.add_(11)
+    out_loc.copy_(
+        torch.tensor([14, 0, 11, 0, 2, 0, 5], device=DEVICE, dtype=index_dtype)
+    )
+    check(graph.replay)
+    positions.add_(7)
+    out_loc.zero_()
+    check(graph.replay)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

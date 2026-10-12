@@ -1058,6 +1058,7 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
     routing_bias: Optional[torch.Tensor] = None
+    valid_hidden_size: Optional[int] = None
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1235,6 +1236,11 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
 
     from flashinfer import trtllm_fp4_block_scale_moe
 
+    valid_dim_kwargs = (
+        {"valid_hidden_size": quant_info.valid_hidden_size}
+        if quant_info.valid_hidden_size is not None
+        else {}
+    )
     trtllm_gen_output = trtllm_fp4_block_scale_moe(
         router_logits.to(torch.bfloat16),
         None,  # routing_bias
@@ -1265,6 +1271,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
         tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
         output=symm_output,
         enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
+        **valid_dim_kwargs,
     )[0]
     return StandardCombineInput(hidden_states=trtllm_gen_output)
 

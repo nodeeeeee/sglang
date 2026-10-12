@@ -90,6 +90,11 @@ class HybridAttnBackend(AttentionBackend):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return self._select_backend(fm).shared_read_ends(fm)
 
+    def get_fused_set_kv_buffer_cache_loc(self, layer, forward_batch):
+        return self._select_backend(
+            forward_batch.forward_mode
+        ).get_fused_set_kv_buffer_cache_loc(layer, forward_batch)
+
     @property
     def supports_full_cuda_graph_chunked_prefix(self) -> bool:
         return self.prefill_backend.supports_full_cuda_graph_chunked_prefix

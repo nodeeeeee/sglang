@@ -103,7 +103,21 @@ def _prepare_flashinfer_mxfp8_activations(
         )
 
         prepared_packed_topk = None
-        x_quant, x_scale = flashinfer_mxfp8_quantize(x, False, alignment=hidden_size)
+        # The native SM100 quantizer writes the padded columns directly. The
+        # CuTe path materializes a zero-filled, padded BF16 input first.
+        quant_kwargs = {}
+        if (
+            x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and x.is_contiguous()
+            and x.shape[-1] < hidden_size
+            and get_device_capability() == (10, 0)
+        ):
+            quant_kwargs["backend"] = "cuda"
+        x_quant, x_scale = flashinfer_mxfp8_quantize(
+            x, False, alignment=hidden_size, **quant_kwargs
+        )
         x_scale = x_scale.view(torch.float8_e4m3fn).reshape(*x.shape[:-1], -1)
     else:
         from sglang.kernels.ops.quantization.per_token_group_quant import (
@@ -409,6 +423,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
         self._use_sm90_humming = False
+        self._flashinfer_valid_hidden_size = None
         # When `flashinfer_mxfp4` is enabled, dispatch to one of three FlashInfer
         # entry points depending on the GPU:
         #   - SM100 (Blackwell)  -> trtllm_fp4_block_scale_moe (existing)
@@ -945,6 +960,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.stack(gemm2_bias_shuffled).reshape(E, -1),
                 requires_grad=False,
             )
+            if (
+                self._fi_kernel == "trtllm_sm100"
+                and self.flashinfer_mxfp4_moe_precision == "default"
+                and self.moe_runner_config.activation != "situ"
+            ):
+                from sglang.srt.layers.quantization.mxfp4_valid_hidden import (
+                    compact_output_weights,
+                    supports_valid_hidden_size,
+                )
+
+                if supports_valid_hidden_size():
+                    w2, sf2, bias2, valid_hidden = compact_output_weights(
+                        layer.w2_weight.data,
+                        layer.w2_weight_scale.data,
+                        layer.w2_weight_bias.data,
+                        layer.hidden_size_unpadded,
+                    )
+                    layer.w2_weight = Parameter(w2, requires_grad=False)
+                    layer.w2_weight_scale = Parameter(sf2, requires_grad=False)
+                    layer.w2_weight_bias = Parameter(bias2, requires_grad=False)
+                    self._flashinfer_valid_hidden_size = valid_hidden
             return
         if _use_aiter:
             if getattr(layer, "w13_weight_bias", None) is not None:
@@ -1584,6 +1620,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
+            valid_hidden_size=self._flashinfer_valid_hidden_size,
         )
         return self.runner.run(dispatch_output, quant_info)
 

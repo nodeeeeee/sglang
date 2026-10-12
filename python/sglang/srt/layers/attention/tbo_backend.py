@@ -196,6 +196,9 @@ class TboAttnBackend(AttentionBackend):
     def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
         return self.primary.get_indexer_metadata(layer_id, forward_batch)
 
+    def get_fused_set_kv_buffer_cache_loc(self, layer, forward_batch):
+        return self.primary.get_fused_set_kv_buffer_cache_loc(layer, forward_batch)
+
     @property
     def verify_mask(self) -> Optional[VerifyMask]:
         # Needs an explicit override: the base declares this as a property, so

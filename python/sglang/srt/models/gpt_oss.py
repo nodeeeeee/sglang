@@ -472,6 +472,12 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
+        fuse_kv_cache = (
+            not _is_npu
+            and not self.rotary_emb._force_native
+            and not (_is_cuda and self.rotary_emb.use_fallback_kernel)
+            and enable_fused_set_kv_buffer(forward_batch, self.attn)
+        )
         extra_args = {}
         if not _is_npu:
             extra_args = {
@@ -481,22 +487,26 @@ class GptOssAttention(nn.Module):
                         layer=self.attn,
                         forward_batch=forward_batch,
                     )
-                    if enable_fused_set_kv_buffer(forward_batch)
+                    if fuse_kv_cache
                     else None
                 ),
             }
         q, k = self.rotary_emb(positions, q, k, **extra_args)
-        inner_state = q, k, v, forward_batch
+        inner_state = q, k, v, forward_batch, fuse_kv_cache
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
+        q, k, v, forward_batch, fused_kv_cache = inner_state
         attn_output = self.attn(
-            *inner_state,
+            q,
+            k,
+            v,
+            forward_batch,
             sinks=self.sinks,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
+            save_kv_cache=not fused_kv_cache,
         )
         output, _ = self.o_proj(attn_output)
         return output

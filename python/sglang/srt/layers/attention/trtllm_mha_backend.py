@@ -549,6 +549,31 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ),
         )
 
+    def get_fused_set_kv_buffer_cache_loc(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        pool = self._swa_kv_pool
+        if pool is None or forward_batch.out_cache_loc is None:
+            return None
+        _, is_swa = pool.layers_mapping[layer.layer_id]
+        layer_pool = pool.swa_kv_pool if is_swa else pool.full_kv_pool
+        # The fused store addresses an affine token row; physical HND pages
+        # cannot be flattened into that layout without a copy.
+        if layer_pool.use_hnd:
+            return None
+        if is_swa:
+            if self.forward_metadata is None:
+                return None
+            loc = self.forward_metadata.swa_out_cache_loc
+            n = forward_batch.out_cache_loc.shape[0]
+            if loc is None or loc.shape[0] < n:
+                return None
+            loc = loc[:n]
+        else:
+            loc = forward_batch.out_cache_loc
+        # The RoPE kernel shares one index type for positions and write slots.
+        return loc if loc.dtype == forward_batch.positions.dtype else None
+
     def _get_layer_cache_loc(
         self,
         layer: RadixAttention,

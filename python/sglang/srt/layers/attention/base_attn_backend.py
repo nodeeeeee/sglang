@@ -79,6 +79,17 @@ class AttentionBackend(ABC):
     # (metadata glue graph) can read it off any backend without hasattr.
     forward_metadata: Optional[object] = None
 
+    def get_fused_set_kv_buffer_cache_loc(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> Optional[torch.Tensor]:
+        """Return snapshotted write slots for fused RoPE/store, or decline.
+
+        Hybrid SWA pools need per-layer index spaces. Opting in requires
+        locations that remain valid after the scheduler's shared-read fence;
+        implementations must not translate through a live allocator mapping.
+        """
+        return None
+
     # The runner's KVIndexTranslator; backends that read through it set the
     # instance attribute in __init__. None means "no translate" -- a backend
     # that never set it cannot serve the unified pool, which the server-args
