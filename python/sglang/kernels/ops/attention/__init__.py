@@ -407,3 +407,19 @@ for _fn in ("fp4_index_logits_paged", "finish_paged_indexer_topk"):
         )
     )
 del _fn
+
+
+register_kernel(
+    KernelSpec(
+        op="attention.gpt_oss_qkv_rope_store",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.gpt_oss_qkv_rope:gpt_oss_qkv_rope_store",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("bfloat16",),
+            description="GPT-OSS QKV + NeoX RoPE + BF16 NHD KV write; H=2880, M=16/32/64",
+        ),
+    )
+)

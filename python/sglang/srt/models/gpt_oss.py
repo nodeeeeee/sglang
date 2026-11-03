@@ -27,6 +27,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -56,6 +57,7 @@ from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import dequant_mxfp4
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -461,6 +463,74 @@ class GptOssAttention(nn.Module):
         )
         self.layer_id = layer_id
 
+    def _try_fused_qkv_rope(self, positions, hidden_states, forward_batch):
+        # Bypass only the plain TP1 BF16 projection. LoRA, quantized linears,
+        # batch-invariant execution and other shapes keep their own dispatch.
+        if not (
+            _is_cuda
+            and forward_batch.forward_mode.is_decode()
+            and hidden_states.shape in ((16, 2880), (32, 2880), (64, 2880))
+            and hidden_states.dtype == torch.bfloat16
+            and hidden_states.is_contiguous()
+            and torch.cuda.get_device_capability(hidden_states.device) == (10, 0)
+            and type(self.qkv_proj) is QKVParallelLinear
+            and type(self.qkv_proj.quant_method) is UnquantizedLinearMethod
+            and not self.qkv_proj.skip_bias_add
+            and not self.qkv_proj.gather_output
+            and self.qkv_proj.weight.shape == (5120, 2880)
+            and self.qkv_proj.weight.dtype == torch.bfloat16
+            and self.qkv_proj.weight.is_contiguous()
+            and self.qkv_proj.bias is not None
+            and self.qkv_proj.bias.dtype == torch.bfloat16
+            and self.qkv_proj.bias.is_contiguous()
+            and self.q_size == 4096
+            and self.kv_size == 512
+            and not is_batch_invariant_mode_enabled()
+            and not get_exec().deterministic.enable_deterministic_inference
+            and get_exec().kernel.bf16_gemm_backend in ("auto", "cutedsl")
+            and positions.dtype == torch.int64
+            and positions.is_contiguous()
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == 64
+            and not self.rotary_emb._force_native
+            and not self.rotary_emb.use_fallback_kernel
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and self.rotary_emb.cos_sin_cache.is_contiguous()
+            and enable_fused_set_kv_buffer(forward_batch, self.attn)
+        ):
+            return None
+        qkv = hidden_states.new_empty((hidden_states.shape[0], 5120))
+        q, k, v = qkv.split([4096, 512, 512], dim=-1)
+        cache = create_fused_set_kv_buffer_arg(
+            value=v, layer=self.attn, forward_batch=forward_batch
+        )
+        if not (
+            cache.reserved_skip_index == 0
+            and cache.cache_loc.dtype == torch.int64
+            and cache.cache_loc.is_contiguous()
+            and cache.k_buffer.dtype == torch.bfloat16
+            and cache.v_buffer.dtype == torch.bfloat16
+            and cache.k_buffer.is_contiguous()
+            and cache.v_buffer.is_contiguous()
+        ):
+            return None
+        from sglang.kernels.ops.attention.gpt_oss_qkv_rope import (
+            gpt_oss_qkv_rope_store,
+        )
+
+        gpt_oss_qkv_rope_store(
+            hidden_states,
+            self.qkv_proj.weight,
+            self.qkv_proj.bias,
+            positions,
+            self.rotary_emb.cos_sin_cache,
+            cache.k_buffer,
+            cache.v_buffer,
+            cache.cache_loc,
+            qkv,
+        )
+        return q, k, v, forward_batch, True
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -469,6 +539,9 @@ class GptOssAttention(nn.Module):
     ):
         if hidden_states.shape[0] == 0:
             return hidden_states, forward_batch, None
+        fused_state = self._try_fused_qkv_rope(positions, hidden_states, forward_batch)
+        if fused_state is not None:
+            return None, forward_batch, fused_state
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
@@ -604,9 +677,12 @@ class GptOssDecoderLayer(nn.Module):
         from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
         self.fuse_norm_quant = (
-            _is_cuda and config.hidden_size == 2880
-            and quant_config is not None and quant_config.get_name() == "mxfp4"
-            and get_parallel().tp_size == 1 and get_parallel().dwdp_size == 1
+            _is_cuda
+            and config.hidden_size == 2880
+            and quant_config is not None
+            and quant_config.get_name() == "mxfp4"
+            and get_parallel().tp_size == 1
+            and get_parallel().dwdp_size == 1
             and get_moe_runner_backend().is_flashinfer_mxfp4()
             and torch.cuda.get_device_capability() == (10, 0)
         )
@@ -743,9 +819,11 @@ class GptOssModel(nn.Module):
                     positions,
                     hidden_states,
                     forward_batch,
-                    capture_output=aux_hidden_states.capture
-                    if i in self.layers_to_capture
-                    else None,
+                    capture_output=(
+                        aux_hidden_states.capture
+                        if i in self.layers_to_capture
+                        else None
+                    ),
                 )
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
@@ -756,9 +834,11 @@ class GptOssModel(nn.Module):
                     hidden_states,
                     forward_batch,
                     self.norm,
-                    capture=aux_hidden_states.capture
-                    if self.end_layer in self.layers_to_capture
-                    else None,
+                    capture=(
+                        aux_hidden_states.capture
+                        if self.end_layer in self.layers_to_capture
+                        else None
+                    ),
                 )
             elif self.end_layer in self.layers_to_capture:
                 aux_hidden_states.append(

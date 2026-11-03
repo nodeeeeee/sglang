@@ -177,6 +177,7 @@ class TgvGemmCuteExtKernel:
         c: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         bias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
         stream: cuda.CUstream,
+        epilogue_args: tuple = (),
     ):
         # Each CTA processes one (CTA_M, CTA_N) output tile, no persistence.
         # Round the (M, N) tile counts up to a full cluster so 2-CTA launches
@@ -191,7 +192,7 @@ class TgvGemmCuteExtKernel:
             ),
             self.cluster_shape,
         )
-        self.kernel(a, b, c, bias).launch(
+        self.kernel(a, b, c, bias, epilogue_args).launch(
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
@@ -207,6 +208,7 @@ class TgvGemmCuteExtKernel:
         mB: cute.Tensor,  # (Gemm_N, Gemm_K, Gemm_L), K-major
         mC: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L), M-major
         mBias: cute.Tensor,  # (Gemm_M, Gemm_N, Gemm_L):(1,0,0) — unused when has_bias=False
+        epilogue_args: tuple,
     ):
         """
         Device-side dispatcher: build MMA descriptor, allocate SMEM/TMEM/
@@ -480,7 +482,7 @@ class TgvGemmCuteExtKernel:
         elif warp_idx >= 4:
             # Epilog tid is 128..255 in the CTA; offset to 0..127 for partition.
             epi_tid = tidx - 128
-            self.epilog_warp(
+            self.run_epilog(
                 bar_tma_epilog,
                 bar_mma_epilog,
                 bar_tmem_alloc,
@@ -491,6 +493,9 @@ class TgvGemmCuteExtKernel:
                 epi_tid,
                 c_dtype,
                 d_layout,
+                sA,
+                mC,
+                epilogue_args,
             )
 
         if cutlass.const_expr(self.use_2cta):
@@ -507,6 +512,37 @@ class TgvGemmCuteExtKernel:
             # cross-CTA datum above already flows through mbarrier phases.
             cute.arch.cluster_arrive_relaxed()
             cute.arch.cluster_wait()
+
+    @cute.experimental.jit
+    def run_epilog(
+        self,
+        bar_tma_epilog,
+        bar_mma_epilog,
+        bar_tmem_alloc,
+        tmem_base_ptr,
+        acc_layout: cutlass.Constexpr,
+        gD_tile: cute.Tensor,
+        gBias_tile: cute.Tensor,
+        epi_tid: cutlass.Int32,
+        c_dtype: cutlass.Constexpr,
+        d_layout: cutlass.Constexpr,
+        scratch: cute.Tensor,
+        output: cute.Tensor,
+        epilogue_args: tuple,
+    ):
+        """Extension point for fused consumers of the rounded GEMM output."""
+        self.epilog_warp(
+            bar_tma_epilog,
+            bar_mma_epilog,
+            bar_tmem_alloc,
+            tmem_base_ptr,
+            acc_layout,
+            gD_tile,
+            gBias_tile,
+            epi_tid,
+            c_dtype,
+            d_layout,
+        )
 
     # ====================================================================
     # DMA_A WARP — TMA-loads A tiles into sA[..., stage], one per K-iter.
@@ -796,6 +832,7 @@ class TgvGemmCuteExtKernel:
         epi_tid: cutlass.Int32,  # 0..127 within the 4 EPILOG warps
         c_dtype: cutlass.Constexpr,
         d_layout: cutlass.Constexpr,
+        store_destination: Optional[cute.Tensor] = None,
     ):
         # Sync with MMA's alloc_tmem (phase 0 of bar_tmem_alloc): 128 arrivals
         # from this warp + 32 from MMA = 160. tmem_base_ptr is uninitialized
@@ -961,7 +998,10 @@ class TgvGemmCuteExtKernel:
         # stay untouched. So the C++ / vanilla-DSL kernels' explicit predicate
         # dance (make_identity_tensor + elem_less + basic_copy_if) isn't
         # needed; the explicit `predicated_tensor_origin` marker isn't either.
-        cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+        if cutlass.const_expr(store_destination is None):
+            cute_ext.partition_and_copy(thr_t2r, rD, gD_epi[None, None, 0, 0])
+        else:
+            cute_ext.partition_and_copy(thr_t2r, rD, store_destination)
 
 
 # =====================================================================

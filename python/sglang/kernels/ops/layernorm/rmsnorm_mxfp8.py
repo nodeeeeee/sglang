@@ -478,5 +478,6 @@ def fused_norm_quant(x, residual, weight, eps):
     m=x.shape[0]
     q=torch.empty((m,3072), device=x.device, dtype=torch.float8_e4m3fn)
     sf=torch.empty((m,96), device=x.device, dtype=torch.uint8)
-    compiled(m <= 128, 8 <= m <= 128)(x,residual,weight,q.view(torch.uint8),sf,m,eps)
+    # Keep one-row CTAs until a four-row grid can cover B200's 148 SMs.
+    compiled(m <= 148 * 4, 8 <= m <= 128)(x,residual,weight,q.view(torch.uint8),sf,m,eps)
     return q,sf
